@@ -129,12 +129,14 @@ commit(Tid, #vs{ transactions = Ts,
             error({non_serial, Latest})
     end.
 
-rollback(Tid, #vs{ transactions = Ts } = Store) ->
+rollback(Tid, #vs{ transactions = Ts, objects = Objects } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
         none ->
             Store;
-        _ ->
-            remove_tid(Tid, Store)
+        {value, #txn{ added_refs = Added }} ->
+            Objects1 = lists:foldl(fun maps:remove/2, Objects, sets:to_list(Added)),
+            Store1 = Store#vs{ objects = Objects1 },
+            remove_tid(Tid, Store1)
     end.
 
 add_ref(Tid, #vs{} = Object, #vs{ transactions = Ts,
@@ -176,7 +178,6 @@ commit_id(Tid) ->
     Tid#tid{ t = -1 * erlang:monotonic_time(),
              off = erlang:time_offset()
            }.
-
 
 remove_tid(Tid, #vs{ transactions = Ts } = Store) ->
     Ts1 = gb_trees:delete(Tid, Ts),
