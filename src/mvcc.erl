@@ -24,12 +24,10 @@
          rollback/2,
          add_ref/3,
          delete_ref/3,
-         new_tid/0,
-         commit_id/1,
          gen_seqs/1, collect/1
         ]).
 
--record(vs,
+-record(mvcc,
         { committed,         %% committed
           num_generations,
           version_count,
@@ -52,10 +50,9 @@
         { mode = none,
           at,
           value,
-          added_refs = #{},
-          deleted_refs = #{} }).
+          added_refs = sets:new(),
+          deleted_refs = sets:new() }).
 
--record(tid, {t, umi, off}).
 
 %% Because of the interface of gb_trees, we're forced to negate all our times,
 %% which makes the usual comparison operators super confusing
@@ -67,13 +64,13 @@
 -define(NEWER_OF(A,B), min(A,B)).
 
 init(Value) ->
-    #vs{ committed = [ new_generation(?OLDEST, Value) ],
+    #mvcc{ committed = [ new_generation(?OLDEST, Value) ],
          num_generations = 1,
          version_count = 1,
          transactions = gb_trees:from_orddict([])
        }.
 
-read(Tid, #vs{ transactions = Ts } = Store) ->
+read(Tid, #mvcc{ transactions = Ts } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
         {value, #txn{ mode = read, at = At }} ->
             {get_version(At, Store), Store};
@@ -83,10 +80,10 @@ read(Tid, #vs{ transactions = Ts } = Store) ->
             {Val,At} = version_before(Tid, Store),
             Txn = #txn{ mode = read, at = At },
             Ts1 = gb_trees:insert(Tid, Txn, Ts),
-            {Val, Store#vs{ transactions = Ts1 }}
+            {Val, Store#mvcc{ transactions = Ts1 }}
     end.
 
-write(Tid, Value, #vs{ transactions = Ts} = Store) ->
+write(Tid, Value, #mvcc{ transactions = Ts} = Store) ->
     Iter = gb_trees:iterator_from(Tid, Ts),
     case gb_trees:next(Iter) of
         {Tid, #txn{ mode = read } = Txn, Iter1} ->
@@ -94,7 +91,7 @@ write(Tid, Value, #vs{ transactions = Ts} = Store) ->
                 none ->
                     Txn1 = Txn#txn{ mode = write, value = Value },
                     Ts1 = gb_trees:update(Tid, Txn1, Ts),
-                    Store#vs{ transactions = Ts1 };
+                    Store#mvcc{ transactions = Ts1 };
                 {OlderTid, _, _} ->
                     error({non_serial, OlderTid})
             end;
@@ -102,16 +99,16 @@ write(Tid, Value, #vs{ transactions = Ts} = Store) ->
             %% Once a transaction has written, it's allowed to re-write
             Txn1 = Txn#txn{ value = Value },
             Ts1 = gb_trees:update(Tid, Txn1, Ts),
-            Store#vs{ transactions = Ts1 };
+            Store#mvcc{ transactions = Ts1 };
         {_OlderTid, _, _} ->
             %% If this transaction is just going to clobber the value
             %% it doesn't matter if an older transaction has read/written it
             Txn1 = #txn{ mode = write, value = Value },
             Ts1 = gb_trees:insert(Tid, Txn1, Ts),
-            Store#vs{ transactions = Ts1}
+            Store#mvcc{ transactions = Ts1}
     end.
 
-commit(Tid, #vs{ transactions = Ts,
+commit(Tid, #mvcc{ transactions = Ts,
                  committed = [#gen{ latest = Latest }|_] } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
         none ->
@@ -122,24 +119,24 @@ commit(Tid, #vs{ transactions = Ts,
             Store1;
         {value, #txn{ mode = write, value = Val, at = At}}
           when At =:= Latest orelse At == undefined ->
-            Store1 = add_version(commit_id(Tid), Val, Store),
+            Store1 = add_version(transactable:commit_id(Tid), Val, Store),
             Store2 = remove_tid(Tid, Store1),
             Store2;
         {value, #txn{ mode = write, at = _NotLatest}} ->
             error({non_serial, Latest})
     end.
 
-rollback(Tid, #vs{ transactions = Ts, objects = Objects } = Store) ->
+rollback(Tid, #mvcc{ transactions = Ts, objects = Objects } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
         none ->
             Store;
         {value, #txn{ added_refs = Added }} ->
             Objects1 = lists:foldl(fun maps:remove/2, Objects, sets:to_list(Added)),
-            Store1 = Store#vs{ objects = Objects1 },
+            Store1 = Store#mvcc{ objects = Objects1 },
             remove_tid(Tid, Store1)
     end.
 
-add_ref(Tid, #vs{} = Object, #vs{ transactions = Ts,
+add_ref(Tid, #mvcc{} = Object, #mvcc{ transactions = Ts,
                                   objects = Objects } = Store) ->
     Ref = make_ref(),
     Ts1 =
@@ -148,48 +145,38 @@ add_ref(Tid, #vs{} = Object, #vs{ transactions = Ts,
                 Added1 = sets:add_element(Ref, Added),
                 gb_trees:update(Tid, Txn#txn{added_refs = Added1}, Ts);
             none ->
-                Txn = #txn{ added_refs = set:from_list([Ref]) },
+                Txn = #txn{ added_refs = sets:from_list([Ref]) },
                 gb_trees:insert(Tid, Txn, Ts)
         end,
     Objects1 = maps:put(Ref, Object, Objects),
-    Store#vs{ transactions = Ts1,
+    Store#mvcc{ transactions = Ts1,
                    objects = Objects1
             }.
 
-delete_ref(Tid, Ref, #vs{ transactions = Ts } = Store) ->
+delete_ref(Tid, Ref, #mvcc{ transactions = Ts } = Store) ->
     Ts1 =
         case gb_trees:lookup(Tid, Ts) of
             {value, #txn{ deleted_refs = Deleted } = Txn} ->
                 Deleted1 = sets:add_element(Ref, Deleted),
                 gb_trees:update(Tid, Txn#txn{deleted_refs = Deleted1}, Ts);
             none ->
-                Txn = #txn{ deleted_refs = set:from_list([Ref]) },
+                Txn = #txn{ deleted_refs = sets:from_list([Ref]) },
                 gb_trees:insert(Tid, Txn, Ts)
         end,
-    Store#vs{ transactions = Ts1 }.
+    Store#mvcc{ transactions = Ts1 }.
 
-new_tid() ->
-    #tid{ t = -1 * erlang:monotonic_time(),
-          umi = -1 * erlang:unique_integer([monotonic]),
-          off = erlang:time_offset()
-        }.
 
-commit_id(Tid) ->
-    Tid#tid{ t = -1 * erlang:monotonic_time(),
-             off = erlang:time_offset()
-           }.
-
-remove_tid(Tid, #vs{ transactions = Ts } = Store) ->
+remove_tid(Tid, #mvcc{ transactions = Ts } = Store) ->
     Ts1 = gb_trees:delete(Tid, Ts),
     case gb_trees:is_empty(Ts1) of
-        true -> Store#vs{ transactions = Ts1, oldest_trans = undefined };
+        true -> Store#mvcc{ transactions = Ts1, oldest_trans = undefined };
         false ->
             {Oldest, _} = gb_trees:largest(Ts1),
-            Store#vs{ transactions = Ts1, oldest_trans = Oldest }
+            Store#mvcc{ transactions = Ts1, oldest_trans = Oldest }
     end.
 
-add_version(Tid, Txn, #vs{} = Store) ->
-    Store1 = #vs{ committed = [CurrentGen | OlderGens],
+add_version(Tid, Txn, #mvcc{} = Store) ->
+    Store1 = #mvcc{ committed = [CurrentGen | OlderGens],
                   num_generations = NGen,
                   max_generations = MaxGen,
                   version_count = VCount
@@ -197,23 +184,23 @@ add_version(Tid, Txn, #vs{} = Store) ->
     #gen{ count = CurrentCount } = CurrentGen,
     if NGen < MaxGen andalso CurrentCount >= (VCount / NGen) ->
             NewGen = new_generation(Tid, Txn),
-            Store1#vs{ committed = [NewGen, CurrentGen | OlderGens],
+            Store1#mvcc{ committed = [NewGen, CurrentGen | OlderGens],
                        version_count = VCount + 1,
                        num_generations = NGen + 1 };
        true ->
             CurrentGen1 = add_to_generation(Tid, Txn, CurrentGen),
-            Store1#vs{ committed = [CurrentGen1 | OlderGens],
+            Store1#mvcc{ committed = [CurrentGen1 | OlderGens],
                        version_count = VCount + 1 }
     end.
 
-get_version(Tid, #vs{ committed = Generations }) ->
+get_version(Tid, #mvcc{ committed = Generations }) ->
     get_version(Tid, Generations);
 get_version(Tid, [#gen{ earliest = Earliest } | Generations]) when ?IS_NEWER(Earliest, Tid) ->
     get_version(Tid, Generations);
 get_version(Tid, [#gen{ values = Values } | _]) ->
     gb_trees:get(Tid, Values).
 
-version_before(Tid, #vs{ committed = Generations }) ->
+version_before(Tid, #mvcc{ committed = Generations }) ->
     version_before(Tid, Generations);
 version_before(Tid, [#gen{ earliest = Earliest } | Generations]) when ?IS_NEWER(Earliest, Tid) ->
     version_before(Tid, Generations);
@@ -252,16 +239,16 @@ add_to_generation(Tid, #txn{ value = Value,
                     deleted_refs = sets:union(GenDelRefs, TxnDelRefs),
                     values = Vals1 }.
 
-gc(#vs{ oldest_trans = OldestTrans,
+gc(#mvcc{ oldest_trans = OldestTrans,
         oldest_gen = OldestGen } = Store) when ?IS_NEWER(OldestGen, OldestTrans) ->
     Store;
-gc(#vs{ committed = Generations,
+gc(#mvcc{ committed = Generations,
         oldest_trans = OldestTrans,
         objects = Objects } = Store) ->
     {Generations1, OldestGeneration, NumGenerations, VersionCount, DeletedRefs}
         = clean_generations(OldestTrans, Generations),
     Objects1 = lists:foldl(fun maps:remove/2, Objects, DeletedRefs),
-    Store#vs{ committed = Generations1,
+    Store#mvcc{ committed = Generations1,
               oldest_gen = OldestGeneration,
               num_generations = NumGenerations,
               version_count = VersionCount,
@@ -290,19 +277,19 @@ transaction_test() ->
     Store1 = init(5),
     io:format("Store1: ~p~n",[Store1]),
 
-    Trans1 = new_tid(),
+    Trans1 = transactable:new_tid(),
     {5, Store2} = read(Trans1, Store1),
     io:format("Store2: ~p~n",[Store2]),
 
     Store3 = write(Trans1, 6, Store2),
     io:format("Store3: ~p~n",[Store3]),
 
-    Trans2 = new_tid(),
+    Trans2 = transactable:new_tid(),
     {5, Store4} = read(Trans2, Store3),
     io:format("Store4: ~p~n",[Store4]),
 
     Store5 = commit(Trans1, Store4),
-    Trans3 = new_tid(),
+    Trans3 = transactable:new_tid(),
     io:format("Store5: ~p~n",[Store5]),
 
     {6, _Store6} = read(Trans3, Store5).
@@ -320,7 +307,7 @@ transaction_seq_test_() ->
 transaction_seq_test(Seq) ->
     io:format("Seq: ~p~n",[Seq]),
     Store = init(0),
-    Transactions = [ {N, new_tid(), read, undefined} || N <- lists:seq(1,4) ],
+    Transactions = [ {N, transactable:new_tid(), read, undefined} || N <- lists:seq(1,4) ],
     transaction_seq_test(Store, Seq, Transactions).
 
 
@@ -328,7 +315,7 @@ transaction_seq_test(Store, [N|Ns], Ts) ->
     {Store1, Ts1} = perform_nth(Store, N, Ts),
     transaction_seq_test(Store1, Ns, Ts1);
 transaction_seq_test(Store, _Ns, []) ->
-    {10,_} = read(new_tid(), Store);
+    {10,_} = read(transactable:new_tid(), Store);
 transaction_seq_test(_Store, [], Ts) ->
     {error, transactions_incomplete, Ts}.
 
@@ -359,7 +346,7 @@ perform(Store, {Add, Tid, read, undefined}) ->
     catch
         error:too_old ->
             io:format("Transaction ~p too old~n",[Add]),
-            {Store, {Add, new_tid(), read, undefined}}
+            {Store, {Add, transactable:new_tid(), read, undefined}}
     end;
 perform(Store, {Add, Tid, write, Val}) ->
     try write(Tid, Val+Add, Store) of
@@ -371,7 +358,7 @@ perform(Store, {Add, Tid, write, Val}) ->
         error:{non_serial,_} ->
             io:format("Transaction ~p rolled back~n",[Add]),
             Store1 = rollback(Tid, Store),
-            {Store1, {Add, new_tid(), read, undefined}}
+            {Store1, {Add, transactable:new_tid(), read, undefined}}
     end;
 perform(Store, {Add, Tid, commit, _}) ->
     try commit(Tid, Store) of
@@ -382,7 +369,7 @@ perform(Store, {Add, Tid, commit, _}) ->
         error:{non_serial,_} ->
             io:format("Transaction ~p rolled back~n",[Add]),
             Store1 = rollback(Tid, Store),
-            {Store1, {Add, new_tid(), read, undefined}}
+            {Store1, {Add, transactable:new_tid(), read, undefined}}
     end.
 
 gen_seqs(Counts) ->
