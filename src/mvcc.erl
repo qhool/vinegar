@@ -20,10 +20,12 @@
 -export([init/1,
          read/2,
          write/3,
+         prepare/2,
          commit/2,
          rollback/2,
          add_ref/3,
          delete_ref/3,
+         update_ref/4,
          gen_seqs/1, collect/1
         ]).
 
@@ -33,6 +35,7 @@
           version_count,
           oldest_gen,
           transactions,      %% pending transactions
+          prepared_tid,
           oldest_trans,
           max_generations = 4,
           objects            %% referenced
@@ -47,11 +50,14 @@
         }).
 
 -record(txn,
-        { mode = none,
+        { mode = none :: none | refs | read | write,
+          prepared = false,
           at,
           value,
           added_refs = sets:new(),
-          deleted_refs = sets:new() }).
+          deleted_refs = sets:new(),
+          updated_refs = sets:new()
+        }).
 
 
 %% Because of the interface of gb_trees, we're forced to negate all our times,
@@ -65,27 +71,37 @@
 
 init(Value) ->
     #mvcc{ committed = [ new_generation(?OLDEST, Value) ],
-         num_generations = 1,
-         version_count = 1,
-         transactions = gb_trees:from_orddict([])
-       }.
+           num_generations = 1,
+           version_count = 1,
+           transactions = gb_trees:from_orddict([])
+         }.
 
 read(Tid, #mvcc{ transactions = Ts } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
+        {value, #txn{ prepared = true }} ->
+            error(activity_after_prepare);
         {value, #txn{ mode = read, at = At }} ->
             {get_version(At, Store), Store};
         {value, #txn{ mode = write, value = Val }} ->
             {Val, Store};
+        {value, #txn{ mode = refs } = Txn} ->
+            first_read(Tid, Txn, Store);
         none ->
-            {Val,At} = version_before(Tid, Store),
-            Txn = #txn{ mode = read, at = At },
-            Ts1 = gb_trees:insert(Tid, Txn, Ts),
-            {Val, Store#mvcc{ transactions = Ts1 }}
+            first_read(Tid, #txn{}, Store)
     end.
+
+first_read(Tid, Txn0, #mvcc{ transactions = Ts } = Store) ->
+    {Val,At} = version_before(Tid, Store),
+    Txn = Txn0#txn{ mode = read, at = At },
+    Ts1 = gb_trees:insert(Tid, Txn, Ts),
+    {Val, Store#mvcc{ transactions = Ts1 }}.
+
 
 write(Tid, Value, #mvcc{ transactions = Ts} = Store) ->
     Iter = gb_trees:iterator_from(Tid, Ts),
     case gb_trees:next(Iter) of
+        {Tid, #txn{ prepared = true }} ->
+            error(activity_after_prepare);
         {Tid, #txn{ mode = read } = Txn, Iter1} ->
             case gb_trees:next(Iter1) of
                 none ->
@@ -100,31 +116,87 @@ write(Tid, Value, #mvcc{ transactions = Ts} = Store) ->
             Txn1 = Txn#txn{ value = Value },
             Ts1 = gb_trees:update(Tid, Txn1, Ts),
             Store#mvcc{ transactions = Ts1 };
+        {Tid, #txn{ mode = refs } = Txn, _Itern1} ->
+            clobber_write( Tid, Txn, Value, Store);
         {_OlderTid, _, _} ->
             %% If this transaction is just going to clobber the value
             %% it doesn't matter if an older transaction has read/written it
-            Txn1 = #txn{ mode = write, value = Value },
-            Ts1 = gb_trees:insert(Tid, Txn1, Ts),
-            Store#mvcc{ transactions = Ts1}
+            clobber_write( Tid, #txn{}, Value, Store)
     end.
 
-commit(Tid, #mvcc{ transactions = Ts,
-                 committed = [#gen{ latest = Latest }|_] } = Store) ->
+clobber_write(Tid, Txn0, Value, #mvcc{ transactions = Ts } = Store) ->
+    Txn1 = Txn0#txn{ mode = write, value = Value },
+    Ts1 = gb_trees:insert(Tid, Txn1, Ts),
+    Store#mvcc{ transactions = Ts1 }.
+
+prepare(Tid, #mvcc{ prepared_tid = Tid } = Store) ->
+    Store;
+prepare(Tid, #mvcc{ transactions = Ts, prepared_tid = PreparedTid,
+                    committed = [#gen{ latest = Latest }|_] } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
         none ->
             Store;
-        {value, #txn{ mode = read }} ->
-            %% this transaction has only read the value
-            Store1 = remove_tid(Tid, Store),
-            Store1;
-        {value, #txn{ mode = write, value = Val, at = At}}
+        {value, #txn{ mode = write, at = At} = Txn}
           when At =:= Latest orelse At == undefined ->
-            Store1 = add_version(transactable:commit_id(Tid), Val, Store),
-            Store2 = remove_tid(Tid, Store1),
-            Store2;
+            if PreparedTid == undefined ->
+                    do_prepare(Tid, Txn, Store#mvcc{ prepared_tid = Tid });
+               true ->
+                    error(preparing)
+            end;
         {value, #txn{ mode = write, at = _NotLatest}} ->
-            error({non_serial, Latest})
+            error({non_serial, Latest});
+        {value, #txn{} = Txn} ->
+            do_prepare(Tid, Txn, Store)
     end.
+
+do_prepare(Tid, Txn, #mvcc{ objects = Objects,
+                            transactions = Ts } = Store) ->
+    Txn1 = Txn#txn{ prepared = true },
+    Ts1 = gb_trees:update(Tid, Txn1, Ts),
+    Objects1 = prepare_refs(Tid, Objects, transaction_refs(Txn)),
+    Store#mvcc{ transactions = Ts1, objects = Objects1 }.
+
+transaction_refs(#txn{ added_refs = Added,
+                       updated_refs = Updated }) ->
+    lists:sort(sets:to_list(sets:union(Added, Updated))).
+
+prepare_refs(Tid, Objects, [Ref | Refs]) ->
+    #{ Ref := Obj } = Objects,
+    Obj1 = prepare(Tid, Obj),
+    Objects1 = Objects#{ Ref := Obj1 },
+    prepare_refs( Tid, Objects1, Refs );
+prepare_refs(_Tid, Objects, []) ->
+    Objects.
+
+commit(Tid, #mvcc{ prepared_tid = OtherTid }) when OtherTid =/= undefined,
+                                                   OtherTid =/= Tid ->
+    error(preparing);
+commit(Tid, #mvcc{ transactions = Ts } = Store) ->
+    case gb_trees:lookup(Tid, Ts) of
+        none ->
+            Store;
+        {value, #txn{ prepared = false }} ->
+            commit(Tid, prepare(Tid, Store));
+        {value, #txn{ mode = write, value = Val} = Txn} ->
+            Store1 = do_commit(Tid, Txn, Store),
+            add_version(transactable:commit_id(Tid), Val, Store1);
+        {value, #txn{} = Txn} ->
+            %% this transaction has not written the value
+            do_commit(Tid, Txn, Store)
+    end.
+
+do_commit(Tid, Txn, #mvcc{ objects = Objects } = Store) ->
+    Store1 = remove_tid(Tid, Store),
+    Objects1 = commit_refs(Tid, Objects, transaction_refs(Txn)),
+    Store1#mvcc{ objects = Objects1 }.
+
+commit_refs(Tid, Objects, [Ref | Refs]) ->
+    #{ Ref := Obj } = Objects,
+    Obj1 = commit(Tid, Obj),
+    Objects1 = Objects#{ Ref := Obj1 },
+    commit_refs( Tid, Objects1, Refs );
+commit_refs(_Tid, Objects, []) ->
+    Objects.
 
 rollback(Tid, #mvcc{ transactions = Ts, objects = Objects } = Store) ->
     case gb_trees:lookup(Tid, Ts) of
@@ -137,35 +209,63 @@ rollback(Tid, #mvcc{ transactions = Ts, objects = Objects } = Store) ->
     end.
 
 add_ref(Tid, #mvcc{} = Object, #mvcc{ transactions = Ts,
-                                  objects = Objects } = Store) ->
+                                      objects = Objects } = Store) ->
     Ref = make_ref(),
     Ts1 =
         case gb_trees:lookup(Tid, Ts) of
+            {value, #txn{ prepared = true }} ->
+                error(activity_after_prepare);
             {value, #txn{ added_refs = Added } = Txn} ->
                 Added1 = sets:add_element(Ref, Added),
                 gb_trees:update(Tid, Txn#txn{added_refs = Added1}, Ts);
             none ->
-                Txn = #txn{ added_refs = sets:from_list([Ref]) },
+                Txn = #txn{ mode = refs, added_refs = sets:from_list([Ref]) },
                 gb_trees:insert(Tid, Txn, Ts)
         end,
     Objects1 = maps:put(Ref, Object, Objects),
-    Store#mvcc{ transactions = Ts1,
-                   objects = Objects1
-            }.
+    {Ref, Store#mvcc{ transactions = Ts1,
+                      objects = Objects1
+                    }}.
 
 delete_ref(Tid, Ref, #mvcc{ transactions = Ts } = Store) ->
     Ts1 =
         case gb_trees:lookup(Tid, Ts) of
+            {value, #txn{ prepared = true }} ->
+                error(activity_after_prepare);
             {value, #txn{ deleted_refs = Deleted } = Txn} ->
                 Deleted1 = sets:add_element(Ref, Deleted),
                 gb_trees:update(Tid, Txn#txn{deleted_refs = Deleted1}, Ts);
             none ->
-                Txn = #txn{ deleted_refs = sets:from_list([Ref]) },
+                Txn = #txn{ mode = refs, deleted_refs = sets:from_list([Ref]) },
                 gb_trees:insert(Tid, Txn, Ts)
         end,
     Store#mvcc{ transactions = Ts1 }.
 
-
+update_ref(Tid, Ref, #mvcc{} = Object, #mvcc{ transactions = Ts,
+                                              objects = Objects } = Store) ->
+    Ts1 =
+        case gb_trees:lookup(Tid, Ts) of
+            {value, #txn{ prepared = true }} ->
+                error(activity_after_prepare);
+            {value, #txn{ updated_refs = Updated, added_refs = Added } = Txn0} ->
+                Txn1 =
+                    case sets:member(Ref, Added) of
+                        true -> Txn0;
+                        _ ->
+                            Updated1 = sets:add_element(Ref, Updated),
+                            Txn0#txn{ updated_refs = Updated1 }
+                    end,
+                gb_trees:update(Tid, Txn1, Ts);
+            none ->
+                Txn = #txn{ mode = refs, updated_refs = sets:from_list([Ref]) },
+                gb_trees:insert(Tid, Txn, Ts)
+        end,
+    Objects1 = maps:update(Ref, Object, Objects),
+    Store#mvcc{ transactions = Ts1,
+                objects = Objects1
+              }.
+remove_tid(Tid, #mvcc{ prepared_tid = Tid } = Store) ->
+    remove_tid(Tid, Store#mvcc{ prepared_tid = undefined});
 remove_tid(Tid, #mvcc{ transactions = Ts } = Store) ->
     Ts1 = gb_trees:delete(Tid, Ts),
     case gb_trees:is_empty(Ts1) of
@@ -298,8 +398,6 @@ transaction_seq_test_() ->
     %% Each transaction: reads the value, adds N, and commits it
     %% Regardless of order of execution, the final sum should be the same
     Seqs = gen_seqs({3,3,3,3}),
-    %% Seqs = [[4,4,3,3,3,2,2,4,2,1,1,1]],
-    io:format("testing ~p sequences~n",[Seqs]),
     Tests = [ {timeout, 1, fun() -> transaction_seq_test(Seq) end} 
               || Seq <- Seqs ],
     {inparallel, 500, Tests}.

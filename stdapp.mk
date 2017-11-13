@@ -192,7 +192,7 @@ endif
 -include stdapp.local.mk
 
 # ensure sane default values if not already defined at this point
-ERLC_FLAGS ?= +debug_info +warn_obsolete_guard +warn_export_all
+ERLC_FLAGS ?= -Werror +debug_info +warn_obsolete_guard +warn_export_all
 YRL_FLAGS ?=
 EDOC_OPTS ?= {def,{version,"$(VSN)"}},todo,no_packages
 
