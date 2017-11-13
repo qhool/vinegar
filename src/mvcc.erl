@@ -17,7 +17,7 @@
 -module(mvcc).
 -include_lib("eunit/include/eunit.hrl").
 
--export([init/1,
+-export([init/1, init/2,
          read/2,
          write/3,
          prepare/2,
@@ -70,7 +70,14 @@
 -define(NEWER_OF(A,B), min(A,B)).
 
 init(Value) ->
+    init(fun(_) -> Value end, []).
+
+init(ValueFun, ObjList) ->
+    Refs = [ make_ref() || _ <- ObjList],
+    Objects = maps:from_list(lists:zip(Refs,ObjList)),
+    Value = ValueFun(Refs),
     #mvcc{ committed = [ new_generation(?OLDEST, Value) ],
+           objects = Objects,
            num_generations = 1,
            version_count = 1,
            transactions = gb_trees:from_orddict([])
